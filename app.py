@@ -208,7 +208,7 @@ if st.button("Generate Itinerary"):
         #     "budget": total_budget,
         #     "tier": budget_tier,
         #     "interests": primary_interests,
-        #     "pace": pace,
+        #     "pace": pace
         #     "experience": experience_type
         
         with st.spinner("Generating AI itinerary..."):
