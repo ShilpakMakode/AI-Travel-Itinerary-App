@@ -1,5 +1,6 @@
 import streamlit as st
 import requests
+import os
 from datetime import date
 from llm_engine import generate_itinerary
 
@@ -7,12 +8,20 @@ st.set_page_config(page_title="AI Travel Planner", layout="wide")
 
 st.title("AI Travel Itinerary Planner")
 st.markdown("Create realistic, validated and budget-aware travel plans.")
+st.caption(
+    f"LLM Provider: `{os.getenv('LLM_PROVIDER', 'openai')}` | "
+    f"Model: `{os.getenv('LLM_MODEL', 'default')}`"
+)
 
 # -------------------------
 # Session State
 # -------------------------
 if "itinerary_generated" not in st.session_state:
     st.session_state.itinerary_generated = False
+if "itinerary" not in st.session_state:
+    st.session_state.itinerary = None
+if "trip_payload" not in st.session_state:
+    st.session_state.trip_payload = None
 
 # -------------------------
 # Utility: Validate City
@@ -28,11 +37,13 @@ def validate_city(city):
         response = requests.get(
             url,
             params=params,
-            headers={"User-Agent": "travel-app"}
+            headers={"User-Agent": "travel-app"},
+            timeout=8
         )
+        response.raise_for_status()
         data = response.json()
         return len(data) > 0
-    except:
+    except requests.RequestException:
         return False
 
 
@@ -176,10 +187,10 @@ if st.button("Generate Itinerary"):
     if not origin_city or not destination_city:
         errors.append("Origin and Destination cities are required.")
 
-    if not validate_city(origin_city):
+    if origin_city and not validate_city(origin_city):
         errors.append("Invalid Origin City.")
 
-    if not validate_city(destination_city):
+    if destination_city and not validate_city(destination_city):
         errors.append("Invalid Destination City.")
 
     if total_budget <= 0:
@@ -192,41 +203,45 @@ if st.button("Generate Itinerary"):
         for e in errors:
             st.error(e)
         st.session_state.itinerary_generated = False
+        st.session_state.itinerary = None
     else:
         st.success("Inputs validated successfully.")
-        
-        
-        st.session_state.itinerary_generated = True
 
-        # st.json({
-        #     "origin": origin_city,
-        #     "destination": destination_city,
-        #     "days": total_days,
-        #     "travel_type": travel_type,
-        #     "adults": adults,
-        #     "children": children,
-        #     "budget": total_budget,
-        #     "tier": budget_tier,
-        #     "interests": primary_interests,
-        #     "pace": pace,
-        #     "experience": experience_type
-        
+        payload = {
+            "origin": origin_city,
+            "destination": destination_city,
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "days": total_days,
+            "budget": int(total_budget),
+            "budget_tier": budget_tier,
+            "travel_type": travel_type,
+            "adults": int(adults),
+            "children": int(children),
+            "interests": primary_interests,
+            "pace": pace,
+            "experience": experience_type
+        }
+
         with st.spinner("Generating AI itinerary..."):
-            llm_output = generate_itinerary({
-                "destination": destination_city,
-                "days": total_days,
-                "budget": total_budget,
-                "travel_type": travel_type,
-                "adults": adults,
-                "children": children,
-                "interests": primary_interests,
-                "pace": pace,
-                "experience": experience_type
-    })
+            try:
+                llm_output = generate_itinerary(payload)
+                st.session_state.itinerary = llm_output
+                st.session_state.trip_payload = payload
+                st.session_state.itinerary_generated = True
+            except Exception as exc:
+                st.session_state.itinerary_generated = False
+                st.session_state.itinerary = None
+                st.session_state.trip_payload = None
+                st.error(f"Failed to generate itinerary: {exc}")
+                st.info(
+                    "If using Groq, set GROQ_API_KEY and LLM_PROVIDER=groq. "
+                    "If you see rate/quota errors, check your Groq usage limits."
+                )
 
-        st.write(llm_output)
-        
-        
+if st.session_state.itinerary:
+    st.subheader("Generated Itinerary")
+    st.markdown(st.session_state.itinerary)
 
 
 # =========================
@@ -237,9 +252,26 @@ if st.session_state.itinerary_generated:
     st.divider()
     st.subheader("Refine Your Itinerary")
 
-    followup = st.text_input(
-        "Modify your plan (e.g., reduce budget, add adventure, remove long drives...)"
-    )
+    with st.form("refine_itinerary_form"):
+        followup = st.text_input(
+            "Modify your plan (e.g., reduce budget, add adventure, remove long drives...)"
+        )
+        refine_submitted = st.form_submit_button("Refine Itinerary")
 
-    if followup:
-        st.write("Refinement request will be processed by AI.")
+    if refine_submitted:
+        if not followup.strip():
+            st.error("Please enter a customization request.")
+        elif not st.session_state.trip_payload or not st.session_state.itinerary:
+            st.error("Missing itinerary context. Please generate itinerary again.")
+        else:
+            with st.spinner("Refining itinerary..."):
+                try:
+                    refined_output = generate_itinerary(
+                        st.session_state.trip_payload,
+                        previous_itinerary=st.session_state.itinerary,
+                        refinement_request=followup.strip()
+                    )
+                    st.session_state.itinerary = refined_output
+                    st.success("Itinerary refined.")
+                except Exception as exc:
+                    st.error(f"Failed to refine itinerary: {exc}")
