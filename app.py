@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import time
 import uuid
 from datetime import date, datetime
 from typing import Dict, List, Tuple
@@ -14,16 +15,53 @@ DB_PATH = "navmarg.db"
 QUESTIONS: List[Tuple[str, str]] = [
     ("origin", "What is your origin city?"),
     ("destination", "What is your destination city?"),
-    ("start_date", "What is your trip start date? (YYYY-MM-DD)"),
-    ("end_date", "What is your trip end date? (YYYY-MM-DD)"),
-    ("travel_type", "What is your travel type? (Solo/Couple/Family/Friends/Business Trip/Group Tour)"),
+    ("start_date", "What is your trip start date?"),
+    ("end_date", "What is your trip end date?"),
+    ("travel_type", "What is your travel type?"),
     ("adults", "How many adults (13+) are traveling?"),
     ("children", "How many children (0-12) are traveling?"),
     ("budget", "What is your total budget in INR?"),
-    ("budget_tier", "What budget tier do you prefer? (Budget/Mid-range/Luxury etc.)"),
+    ("budget_tier", "What budget tier do you prefer?"),
     ("interests", "What are your main interests? (comma separated)"),
-    ("pace", "What travel pace do you prefer? (Relaxed/Balanced/Active)"),
-    ("experience", "What experience style do you want? (Must-see/Hidden Gems/Mix/Local/Instagrammable)"),
+    ("pace", "What travel pace do you prefer?"),
+    ("experience", "What experience style do you want?"),
+]
+
+TRAVEL_TYPES = ["Solo", "Couple", "Family", "Friends", "Business Trip", "Group Tour"]
+BUDGET_TIERS = [
+    "Ultra Budget (Backpacker)",
+    "Budget",
+    "Lower Mid-range",
+    "Mid-range",
+    "Upper Mid-range",
+    "Luxury",
+    "Ultra Luxury",
+]
+PACE_OPTIONS = ["Very Relaxed", "Relaxed", "Balanced", "Active", "Fast-paced"]
+EXPERIENCE_OPTIONS = [
+    "Must-see Landmarks",
+    "Mostly Hidden Gems",
+    "Mix of Both",
+    "Highly Local Experiences",
+    "Instagrammable Spots",
+]
+INTEREST_OPTIONS = [
+    "Nature & Landscapes",
+    "Mountains",
+    "Beaches",
+    "Wildlife",
+    "Adventure Sports",
+    "Road Trips",
+    "History & Heritage",
+    "Food & Culinary",
+    "Nightlife",
+    "Shopping",
+    "Spiritual",
+    "Photography",
+    "Luxury Experiences",
+    "Wellness & Spa",
+    "Local Culture",
+    "Festivals",
 ]
 
 
@@ -187,13 +225,16 @@ def save_itinerary(session_id: str, version: int, raw_plan: str, final_plan: str
     conn.close()
 
 
-def add_assistant_message(content: str) -> None:
-    st.session_state.chat_messages.append({"role": "assistant", "content": content})
+def add_assistant_message(content: str, stream: bool = False) -> None:
+    cleaned = content.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
+    st.session_state.chat_messages.append(
+        {"id": str(uuid.uuid4()), "role": "assistant", "content": cleaned, "stream": stream}
+    )
     save_message(st.session_state.session_id, "assistant", content)
 
 
 def add_user_message(content: str) -> None:
-    st.session_state.chat_messages.append({"role": "user", "content": content})
+    st.session_state.chat_messages.append({"id": str(uuid.uuid4()), "role": "user", "content": content})
     save_message(st.session_state.session_id, "user", content)
 
 
@@ -234,10 +275,16 @@ def validate_slot(slot: str, value: str) -> Tuple[bool, str]:
             return False, f"Please provide a valid number for {slot}."
         if slot == "adults" and parsed_int < 1:
             return False, "At least 1 adult is required."
+        if slot == "adults" and parsed_int > 15:
+            return False, "Adults cannot be more than 15."
         if slot == "children" and parsed_int < 0:
             return False, "Children cannot be negative."
+        if slot == "children" and parsed_int > 15:
+            return False, "Children cannot be more than 15."
         if slot == "budget" and parsed_int < 1000:
             return False, "Budget should be at least 1000 INR."
+        if slot == "budget" and parsed_int > 5000000:
+            return False, "Please enter a realistic budget (up to 50,00,000 INR)."
 
     return True, ""
 
@@ -250,8 +297,14 @@ def _format_navmarg_intro() -> str:
 
 
 def _ask_next_question() -> None:
-    slot, question = get_current_question()
-    add_assistant_message(f"{question}\n\n`(Field: {slot})`")
+    _, question = get_current_question()
+    add_assistant_message(question)
+
+
+def _word_stream(text: str):
+    for word in text.split(" "):
+        yield word + " "
+        time.sleep(0.015)
 
 
 def _generate_initial_itinerary() -> None:
@@ -269,7 +322,7 @@ def _generate_initial_itinerary() -> None:
         "",
     )
 
-    add_assistant_message(final_plan)
+    add_assistant_message(final_plan, stream=True)
     add_assistant_message("Are you satisfied with this plan? Reply `yes` or share changes.")
     st.session_state.agent_state = "awaiting_changes"
     save_session(
@@ -298,7 +351,7 @@ def _generate_refined_itinerary(change_request: str) -> None:
         change_request,
     )
 
-    add_assistant_message(final_plan)
+    add_assistant_message(final_plan, stream=True)
     add_assistant_message("Updated. Are you satisfied now? Reply `yes` or send more changes.")
 
 
@@ -320,29 +373,43 @@ def initialize_session() -> None:
     save_session(st.session_state.session_id, st.session_state.agent_state, st.session_state.current_question_idx)
 
 
-def handle_slot_filling(user_text: str) -> None:
+def _store_current_slot_answer(user_text: str) -> None:
     slot, question = get_current_question()
 
-    try:
-        decision = run_guardrail(user_text, expected_slot=slot)
-    except Exception:
-        decision = {"decision": "ALLOW", "assistant_message": "", "reason": "Guardrail fallback"}
+    structured_slots = {
+        "start_date",
+        "end_date",
+        "travel_type",
+        "adults",
+        "children",
+        "budget",
+        "budget_tier",
+        "pace",
+        "experience",
+    }
 
-    decision_name = decision.get("decision", "ALLOW").upper()
+    if slot not in structured_slots:
+        try:
+            decision = run_guardrail(user_text, expected_slot=slot)
+        except Exception:
+            decision = {"decision": "ALLOW", "assistant_message": "", "reason": "Guardrail fallback"}
 
-    if decision_name == "GREETING":
-        add_assistant_message(_format_navmarg_intro())
-        add_assistant_message(f"Please answer this first:\n\n{question}")
-        return
+        decision_name = decision.get("decision", "ALLOW").upper()
+        if decision_name == "GREETING":
+            add_assistant_message(_format_navmarg_intro())
+            add_assistant_message(f"Please answer this first:\n\n{question}")
+            return
 
-    if decision_name in {"OFFTOPIC", "UNSAFE"}:
-        message = decision.get("assistant_message") or "Please share travel-related input so I can continue."
-        add_assistant_message(f"{message}\n\nCurrent question: {question}")
-        return
+        if decision_name in {"OFFTOPIC", "UNSAFE"}:
+            message = decision.get("assistant_message") or "Please share travel-related input so I can continue."
+            add_assistant_message(f"{message}\n\nCurrent question: {question}")
+            return
 
-    try:
-        normalized = refine_user_answer(slot, user_text)
-    except Exception:
+        try:
+            normalized = refine_user_answer(slot, user_text)
+        except Exception:
+            normalized = user_text.strip()
+    else:
         normalized = user_text.strip()
 
     is_valid, error_message = validate_slot(slot, normalized)
@@ -350,7 +417,10 @@ def handle_slot_filling(user_text: str) -> None:
         add_assistant_message(f"{error_message}\n\nPlease answer again:\n{question}")
         return
 
-    st.session_state.slots[slot] = normalized.strip()
+    if slot in {"adults", "children", "budget"}:
+        st.session_state.slots[slot] = str(_parse_int(normalized))
+    else:
+        st.session_state.slots[slot] = normalized.strip()
     save_slots(st.session_state.session_id, st.session_state.slots, is_complete=False)
 
     st.session_state.current_question_idx += 1
@@ -389,6 +459,85 @@ def handle_refinement(user_text: str) -> None:
     _generate_refined_itinerary(user_text)
 
 
+def _render_slot_input_widget() -> None:
+    slot, question = get_current_question()
+    st.markdown("---")
+
+    with st.form(f"slot_form_{slot}"):
+        submitted = False
+        answer_text = ""
+        display_text = ""
+
+        if slot in {"origin", "destination"}:
+            val = st.text_input("Your answer")
+            submitted = st.form_submit_button("Submit")
+            answer_text = val.strip()
+            display_text = answer_text
+        elif slot in {"start_date", "end_date"}:
+            min_date = date.today()
+            if slot == "end_date" and st.session_state.slots.get("start_date"):
+                min_date = date.fromisoformat(st.session_state.slots["start_date"])
+            val = st.date_input("Select date", min_value=min_date)
+            submitted = st.form_submit_button("Submit")
+            answer_text = val.isoformat()
+            display_text = answer_text
+        elif slot == "travel_type":
+            val = st.selectbox("Select travel type", TRAVEL_TYPES)
+            submitted = st.form_submit_button("Submit")
+            answer_text = val
+            display_text = val
+        elif slot == "adults":
+            val = st.number_input("Number of adults", min_value=1, max_value=15, step=1)
+            submitted = st.form_submit_button("Submit")
+            answer_text = str(int(val))
+            display_text = answer_text
+        elif slot == "children":
+            val = st.number_input("Number of children", min_value=0, max_value=15, step=1)
+            submitted = st.form_submit_button("Submit")
+            answer_text = str(int(val))
+            display_text = answer_text
+        elif slot == "budget":
+            val = st.number_input(
+                "Total budget (INR)",
+                min_value=1000,
+                max_value=5000000,
+                step=1000,
+                format="%d",
+            )
+            submitted = st.form_submit_button("Submit")
+            answer_text = str(int(val))
+            display_text = f"{int(val):,}"
+        elif slot == "budget_tier":
+            val = st.selectbox("Select budget tier", BUDGET_TIERS)
+            submitted = st.form_submit_button("Submit")
+            answer_text = val
+            display_text = val
+        elif slot == "interests":
+            val = st.multiselect("Select interests", INTEREST_OPTIONS)
+            submitted = st.form_submit_button("Submit")
+            answer_text = ", ".join(val)
+            display_text = answer_text
+        elif slot == "pace":
+            val = st.selectbox("Select pace", PACE_OPTIONS)
+            submitted = st.form_submit_button("Submit")
+            answer_text = val
+            display_text = val
+        elif slot == "experience":
+            val = st.selectbox("Select experience style", EXPERIENCE_OPTIONS)
+            submitted = st.form_submit_button("Submit")
+            answer_text = val
+            display_text = val
+
+        if submitted:
+            if not answer_text:
+                add_assistant_message(f"Please answer the question first.\n\n{question}")
+                st.rerun()
+
+            add_user_message(display_text)
+            _store_current_slot_answer(answer_text)
+            st.rerun()
+
+
 def main() -> None:
     st.set_page_config(page_title="NavMarg Travel Agent", layout="centered")
     init_db()
@@ -397,17 +546,26 @@ def main() -> None:
     st.title("NavMarg")
     st.caption("Your AI Travel Agent")
 
-    for msg in st.session_state.chat_messages:
+    for idx, msg in enumerate(st.session_state.chat_messages):
         with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+            if msg["role"] == "assistant" and msg.get("stream"):
+                st.write_stream(_word_stream(msg["content"]))
+                st.session_state.chat_messages[idx]["stream"] = False
+            else:
+                st.markdown(msg["content"])
+
+    if st.session_state.agent_state == "slot_filling":
+        _render_slot_input_widget()
+        return
 
     user_input = st.chat_input("Type your response...")
     if not user_input:
         return
 
     add_user_message(user_input)
+    cleaned_input = user_input.strip().lower()
 
-    if user_input.strip().lower() in {"restart", "start over", "new trip"}:
+    if cleaned_input in {"restart", "start over", "new trip"}:
         st.session_state.initialized = False
         st.rerun()
 
@@ -420,13 +578,12 @@ def main() -> None:
             add_assistant_message("Let's start with your origin city?")
             st.session_state.onboarding_sent = True
             st.session_state.agent_state = "slot_filling"
+            _ask_next_question()
             save_session(
                 st.session_state.session_id,
                 st.session_state.agent_state,
                 st.session_state.current_question_idx,
             )
-    elif st.session_state.agent_state == "slot_filling":
-        handle_slot_filling(user_input)
     elif st.session_state.agent_state == "awaiting_changes":
         handle_refinement(user_input)
     else:
