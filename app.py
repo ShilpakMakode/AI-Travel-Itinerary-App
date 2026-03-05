@@ -1,16 +1,21 @@
 import os
+import re
 import sqlite3
 import time
 import uuid
 from datetime import date, datetime
 from typing import Dict, List, Tuple
 
+import requests
 import streamlit as st
 
 from llm_engine import generate_plan, refine_user_answer, run_guardrail
 
 
 DB_PATH = "navmarg.db"
+SESSION_TIMEOUT_MINUTES = int(os.getenv("SESSION_TIMEOUT_MINUTES", "30"))
+STORE_RAW_MESSAGES = os.getenv("STORE_RAW_MESSAGES", "false").strip().lower() == "true"
+MESSAGE_RETENTION_DAYS = int(os.getenv("MESSAGE_RETENTION_DAYS", "7"))
 
 QUESTIONS: List[Tuple[str, str]] = [
     ("origin", "What is your origin city?"),
@@ -18,11 +23,11 @@ QUESTIONS: List[Tuple[str, str]] = [
     ("start_date", "What is your trip start date?"),
     ("end_date", "What is your trip end date?"),
     ("travel_type", "What is your travel type?"),
-    ("adults", "How many adults (13+) are traveling?"),
-    ("children", "How many children (0-12) are traveling?"),
+    ("adults", "How many adults (18+) are traveling?"),
+    ("children", "How many children (0-17) are traveling?"),
     ("budget", "What is your total budget in INR?"),
     ("budget_tier", "What budget tier do you prefer?"),
-    ("interests", "What are your main interests? (comma separated)"),
+    ("interests", "What are your main interests? Choose all you want."),
     ("pace", "What travel pace do you prefer?"),
     ("experience", "What experience style do you want?"),
 ]
@@ -63,6 +68,25 @@ INTEREST_OPTIONS = [
     "Local Culture",
     "Festivals",
 ]
+
+
+def validate_city(city: str) -> Tuple[bool, bool]:
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {"q": city, "format": "json", "limit": 1}
+    for _ in range(2):
+        try:
+            response = requests.get(
+                url,
+                params=params,
+                headers={"User-Agent": "navmarg-travel-agent"},
+                timeout=8,
+            )
+            response.raise_for_status()
+            data = response.json()
+            return len(data) > 0, False
+        except requests.RequestException:
+            time.sleep(0.3)
+    return False, True
 
 
 def init_db() -> None:
@@ -124,12 +148,39 @@ def init_db() -> None:
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS guardrail_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            slot TEXT,
+            decision TEXT NOT NULL,
+            reason TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        """
+        DELETE FROM messages
+        WHERE julianday(created_at) < julianday('now', ?)
+        """,
+        (f"-{MESSAGE_RETENTION_DAYS} days",),
+    )
     conn.commit()
     conn.close()
 
 
 def _now_iso() -> str:
     return datetime.utcnow().isoformat()
+
+
+def _sanitize_for_storage(content: str) -> str:
+    text = content or ""
+    text = re.sub(r"\b[\w\.-]+@[\w\.-]+\.\w+\b", "[redacted-email]", text)
+    text = re.sub(r"\b(?:\+?\d[\d\-\s]{7,}\d)\b", "[redacted-phone]", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:240]
 
 
 def save_session(session_id: str, state: str, current_question_idx: int) -> None:
@@ -152,11 +203,26 @@ def save_session(session_id: str, state: str, current_question_idx: int) -> None
 
 
 def save_message(session_id: str, role: str, content: str) -> None:
+    stored_content = content if STORE_RAW_MESSAGES else _sanitize_for_storage(content)
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
         "INSERT INTO messages (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-        (session_id, role, content, _now_iso()),
+        (session_id, role, stored_content, _now_iso()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def log_guardrail_decision(session_id: str, slot: str, decision: str, reason: str) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO guardrail_audit (session_id, slot, decision, reason, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (session_id, slot, decision, reason, _now_iso()),
     )
     conn.commit()
     conn.close()
@@ -243,6 +309,10 @@ def get_current_question() -> Tuple[str, str]:
     return QUESTIONS[idx]
 
 
+def _is_question_index_exhausted() -> bool:
+    return st.session_state.current_question_idx >= len(QUESTIONS)
+
+
 def _parse_int(value: str) -> int:
     return int(value.replace(",", "").strip())
 
@@ -286,6 +356,20 @@ def validate_slot(slot: str, value: str) -> Tuple[bool, str]:
         if slot == "budget" and parsed_int > 5000000:
             return False, "Please enter a realistic budget (up to 50,00,000 INR)."
 
+    if slot == "origin":
+        is_valid, unavailable = validate_city(value.strip())
+        if unavailable:
+            return False, "City verification is temporarily unavailable. Please recheck spelling and try again."
+        if not is_valid:
+            return False, "Origin location looks invalid. Please enter a proper city name."
+
+    if slot == "destination":
+        is_valid, unavailable = validate_city(value.strip())
+        if unavailable:
+            return False, "City verification is temporarily unavailable. Please recheck spelling and try again."
+        if not is_valid:
+            return False, "Destination location looks invalid. Please enter a proper city name."
+
     return True, ""
 
 
@@ -301,6 +385,30 @@ def _ask_next_question() -> None:
     add_assistant_message(question)
 
 
+def _auto_apply_travel_type_defaults_and_skip() -> bool:
+    travel_type = st.session_state.slots.get("travel_type", "").strip().lower()
+    if travel_type not in {"solo", "couple"}:
+        return False
+
+    if travel_type == "solo":
+        st.session_state.slots["adults"] = "1"
+        st.session_state.slots["children"] = "0"
+    else:
+        st.session_state.slots["adults"] = "2"
+        st.session_state.slots["children"] = "0"
+
+    idx = st.session_state.current_question_idx
+    changed = False
+    while idx < len(QUESTIONS) and QUESTIONS[idx][0] in {"adults", "children"}:
+        idx += 1
+        changed = True
+
+    if changed:
+        st.session_state.current_question_idx = idx
+        save_slots(st.session_state.session_id, st.session_state.slots, is_complete=False)
+    return changed
+
+
 def _word_stream(text: str):
     for word in text.split(" "):
         yield word + " "
@@ -309,7 +417,19 @@ def _word_stream(text: str):
 
 def _generate_initial_itinerary() -> None:
     with st.spinner("NavMarg is creating your itinerary..."):
-        raw_plan, final_plan = generate_plan(st.session_state.slots)
+        try:
+            raw_plan, final_plan = generate_plan(st.session_state.slots)
+        except Exception as exc:
+            err = str(exc)
+            if "GROQ_API_KEY" in err:
+                msg = (
+                    f"Could not generate itinerary right now: {err}\n\n"
+                    "Please set `GROQ_API_KEY` and try again."
+                )
+            else:
+                msg = f"Could not generate itinerary right now: {err}\n\nPlease try again."
+            add_assistant_message(msg)
+            return
 
     st.session_state.itinerary_version += 1
     st.session_state.latest_raw_plan = raw_plan
@@ -334,11 +454,23 @@ def _generate_initial_itinerary() -> None:
 
 def _generate_refined_itinerary(change_request: str) -> None:
     with st.spinner("NavMarg is refining your itinerary..."):
-        raw_plan, final_plan = generate_plan(
-            st.session_state.slots,
-            previous_itinerary=st.session_state.latest_final_plan,
-            change_request=change_request,
-        )
+        try:
+            raw_plan, final_plan = generate_plan(
+                st.session_state.slots,
+                previous_itinerary=st.session_state.latest_final_plan,
+                change_request=change_request,
+            )
+        except Exception as exc:
+            err = str(exc)
+            if "GROQ_API_KEY" in err:
+                msg = (
+                    f"Could not refine itinerary right now: {err}\n\n"
+                    "Please verify `GROQ_API_KEY` and try again."
+                )
+            else:
+                msg = f"Could not refine itinerary right now: {err}\n\nPlease try again."
+            add_assistant_message(msg)
+            return
 
     st.session_state.itinerary_version += 1
     st.session_state.latest_raw_plan = raw_plan
@@ -369,6 +501,7 @@ def initialize_session() -> None:
     st.session_state.latest_raw_plan = ""
     st.session_state.latest_final_plan = ""
     st.session_state.itinerary_version = 0
+    st.session_state.last_activity_ts = time.time()
 
     save_session(st.session_state.session_id, st.session_state.agent_state, st.session_state.current_question_idx)
 
@@ -395,9 +528,15 @@ def _store_current_slot_answer(user_text: str) -> None:
             decision = {"decision": "ALLOW", "assistant_message": "", "reason": "Guardrail fallback"}
 
         decision_name = decision.get("decision", "ALLOW").upper()
+        log_guardrail_decision(
+            st.session_state.session_id,
+            slot,
+            decision_name,
+            decision.get("reason", ""),
+        )
         if decision_name == "GREETING":
-            add_assistant_message(_format_navmarg_intro())
-            add_assistant_message(f"Please answer this first:\n\n{question}")
+            add_assistant_message(_format_navmarg_intro(), stream=True)
+            add_assistant_message(f"Please answer this first:\n\n{question}", stream=True)
             return
 
         if decision_name in {"OFFTOPIC", "UNSAFE"}:
@@ -424,6 +563,13 @@ def _store_current_slot_answer(user_text: str) -> None:
     save_slots(st.session_state.session_id, st.session_state.slots, is_complete=False)
 
     st.session_state.current_question_idx += 1
+    if slot == "travel_type":
+        skipped = _auto_apply_travel_type_defaults_and_skip()
+        if skipped:
+            add_assistant_message(
+                "Since you selected Solo/Couple, I have auto-set traveler counts and skipped adults/children questions."
+            )
+
     if st.session_state.current_question_idx < len(QUESTIONS):
         save_session(
             st.session_state.session_id,
@@ -439,6 +585,56 @@ def _store_current_slot_answer(user_text: str) -> None:
 
 def handle_refinement(user_text: str) -> None:
     lower = user_text.strip().lower()
+    if len(user_text.strip()) > 800:
+        add_assistant_message(
+            "Your change request is too long. Please keep it under 800 characters for reliable processing."
+        )
+        return
+
+    blocked_keywords = [
+        "gun",
+        "weapon",
+        "buy gun",
+        "sex",
+        "s*x",
+        "porn",
+        "escort",
+        "drugs",
+        "cocaine",
+        "heroin",
+        "kill",
+        "murder",
+    ]
+    if any(keyword in lower for keyword in blocked_keywords):
+        add_assistant_message(
+            "I can only help with safe travel planning. "
+            "Please avoid requests related to weapons, sexual content, drugs, or violence."
+        )
+        log_guardrail_decision(
+            st.session_state.session_id,
+            "refinement",
+            "UNSAFE",
+            "Blocked keyword match in refinement request",
+        )
+        return
+
+    try:
+        decision = run_guardrail(user_text, expected_slot="refinement")
+    except Exception:
+        decision = {"decision": "ALLOW", "assistant_message": "", "reason": "Guardrail fallback"}
+
+    decision_name = decision.get("decision", "ALLOW").upper()
+    log_guardrail_decision(
+        st.session_state.session_id,
+        "refinement",
+        decision_name,
+        decision.get("reason", ""),
+    )
+    if decision_name in {"UNSAFE", "OFFTOPIC"}:
+        add_assistant_message(
+            "Please keep your request strictly related to travel itinerary improvements."
+        )
+        return
 
     if lower in {"yes", "y", "satisfied", "done"}:
         st.session_state.agent_state = "completed"
@@ -460,6 +656,22 @@ def handle_refinement(user_text: str) -> None:
 
 
 def _render_slot_input_widget() -> None:
+    if _is_question_index_exhausted():
+        st.markdown("---")
+        st.info("All required details are collected. Click below to generate itinerary.")
+        if st.button("Generate Itinerary"):
+            _generate_initial_itinerary()
+            st.rerun()
+        return
+
+    if _auto_apply_travel_type_defaults_and_skip():
+        if st.session_state.current_question_idx >= len(QUESTIONS):
+            save_slots(st.session_state.session_id, st.session_state.slots, is_complete=True)
+            _generate_initial_itinerary()
+        else:
+            _ask_next_question()
+        st.rerun()
+
     slot, question = get_current_question()
     st.markdown("---")
 
@@ -487,12 +699,12 @@ def _render_slot_input_widget() -> None:
             answer_text = val
             display_text = val
         elif slot == "adults":
-            val = st.number_input("Number of adults", min_value=1, max_value=15, step=1)
+            val = st.number_input("Number of adults (18+)", min_value=1, max_value=15, step=1)
             submitted = st.form_submit_button("Submit")
             answer_text = str(int(val))
             display_text = answer_text
         elif slot == "children":
-            val = st.number_input("Number of children", min_value=0, max_value=15, step=1)
+            val = st.number_input("Number of children (0-17)", min_value=0, max_value=15, step=1)
             submitted = st.form_submit_button("Submit")
             answer_text = str(int(val))
             display_text = answer_text
@@ -513,7 +725,7 @@ def _render_slot_input_widget() -> None:
             answer_text = val
             display_text = val
         elif slot == "interests":
-            val = st.multiselect("Select interests", INTEREST_OPTIONS)
+            val = st.multiselect("Choose all interests you want", INTEREST_OPTIONS)
             submitted = st.form_submit_button("Submit")
             answer_text = ", ".join(val)
             display_text = answer_text
@@ -534,6 +746,7 @@ def _render_slot_input_widget() -> None:
                 st.rerun()
 
             add_user_message(display_text)
+            st.session_state.last_activity_ts = time.time()
             _store_current_slot_answer(answer_text)
             st.rerun()
 
@@ -545,6 +758,24 @@ def main() -> None:
 
     st.title("NavMarg")
     st.caption("Your AI Travel Agent")
+    if not os.getenv("GROQ_API_KEY"):
+        st.warning(
+            "Missing `GROQ_API_KEY`. Set it before generating itineraries.\n"
+            "Example: `export GROQ_API_KEY=\"your_key\"`"
+        )
+    st.caption(
+        f"Session timeout: {SESSION_TIMEOUT_MINUTES} min | "
+        f"Max output tokens: {os.getenv('MAX_OUTPUT_TOKENS', '1800')}"
+    )
+
+    now_ts = time.time()
+    last_ts = st.session_state.get("last_activity_ts", now_ts)
+    if st.session_state.get("current_question_idx", 0) > len(QUESTIONS):
+        st.session_state.current_question_idx = len(QUESTIONS)
+    if now_ts - last_ts > SESSION_TIMEOUT_MINUTES * 60:
+        st.warning("Session expired due to inactivity. Starting a fresh session.")
+        st.session_state.initialized = False
+        st.rerun()
 
     for idx, msg in enumerate(st.session_state.chat_messages):
         with st.chat_message(msg["role"]):
@@ -563,6 +794,7 @@ def main() -> None:
         return
 
     add_user_message(user_input)
+    st.session_state.last_activity_ts = time.time()
     cleaned_input = user_input.strip().lower()
 
     if cleaned_input in {"restart", "start over", "new trip"}:
@@ -571,11 +803,12 @@ def main() -> None:
 
     if st.session_state.agent_state == "awaiting_first_user_message":
         if not st.session_state.onboarding_sent:
-            add_assistant_message(_format_navmarg_intro())
+            add_assistant_message(_format_navmarg_intro(), stream=True)
             add_assistant_message(
-                "I will ask you a few questions one by one. Once you answer, I will generate your itinerary."
+                "I will ask you a few questions one by one. Once you answer, I will generate your itinerary.",
+                stream=True,
             )
-            add_assistant_message("Let's start with your origin city?")
+            add_assistant_message("Let's start with your origin city?", stream=True)
             st.session_state.onboarding_sent = True
             st.session_state.agent_state = "slot_filling"
             _ask_next_question()

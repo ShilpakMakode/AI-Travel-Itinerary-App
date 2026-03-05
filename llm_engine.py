@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from typing import Dict, Optional, Tuple
 
 from groq import Groq
@@ -35,6 +36,11 @@ def _call_llm(
     user_prompt: str,
     temperature: float = 0.2,
 ) -> str:
+    max_output_tokens = int(os.getenv("MAX_OUTPUT_TOKENS", "1800"))
+    max_prompt_chars = int(os.getenv("MAX_PROMPT_CHARS", "12000"))
+    if len(user_prompt) > max_prompt_chars:
+        raise ValueError("Prompt too long. Please reduce input size.")
+
     try:
         response = client.chat.completions.create(
             model=model_name,
@@ -43,6 +49,7 @@ def _call_llm(
                 {"role": "user", "content": user_prompt},
             ],
             temperature=temperature,
+            max_tokens=max_output_tokens,
         )
         content = response.choices[0].message.content
     except Exception as exc:
@@ -68,6 +75,20 @@ def _extract_json(text: str) -> Dict:
     return json.loads(raw)
 
 
+def _extract_json_with_repair(client: Groq, model_name: str, text: str) -> Dict:
+    try:
+        return _extract_json(text)
+    except Exception:
+        repair_system = """
+You repair malformed JSON.
+Return only valid JSON with the same meaning and keys.
+No markdown, no explanation.
+"""
+        repair_user = f"Malformed JSON to repair:\n{text}"
+        repaired = _call_llm(client, model_name, repair_system, repair_user, temperature=0.0)
+        return _extract_json(repaired)
+
+
 def _sum_day_costs(days: list) -> int:
     total = 0
     for day in days:
@@ -77,6 +98,19 @@ def _sum_day_costs(days: list) -> int:
         except (TypeError, ValueError):
             raise ValueError("Invalid day estimated_cost in planner output.")
     return total
+
+
+def _validate_final_output(text: str) -> Tuple[bool, str]:
+    cleaned = text or ""
+    if re.search(r"<[^>]+>", cleaned):
+        return False, "Output contains HTML tags."
+    if "|" in cleaned:
+        return False, "Output appears tabular."
+    if "Day 1" not in cleaned:
+        return False, "Output missing day-wise structure."
+    if "Total Estimated Cost" not in cleaned:
+        return False, "Output missing total cost summary."
+    return True, ""
 
 
 def run_guardrail(user_text: str, expected_slot: Optional[str] = None) -> Dict:
@@ -246,7 +280,7 @@ Return a full plan in strict JSON with correct arithmetic:
 - budget_breakdown parts must sum to total_budget
 """
     raw_plan_text = _call_llm(client, planner_model, planner_system, planner_user, temperature=0.2)
-    raw_plan = _extract_json(raw_plan_text)
+    raw_plan = _extract_json_with_repair(client, planner_model, raw_plan_text)
 
     if not isinstance(raw_plan, dict):
         raise ValueError("Planner did not return a valid JSON object.")
@@ -279,7 +313,7 @@ Fix arithmetic only and return valid JSON:
 - stay+food+transport+activities+buffer == total_budget
 """
         corrected_text = _call_llm(client, planner_model, planner_system, correction_user, temperature=0.0)
-        raw_plan = _extract_json(corrected_text)
+        raw_plan = _extract_json_with_repair(client, planner_model, corrected_text)
         days_sum = _sum_day_costs(raw_plan.get("days", []))
         total_estimated = int(raw_plan.get("total_estimated_cost", 0))
         budget_parts = raw_plan.get("budget_breakdown", {})
@@ -320,4 +354,27 @@ Output a cleaner final itinerary for end users with this structure:
 """
     final_plan = _call_llm(client, humanizer_model, humanizer_system, humanizer_user, temperature=0.4)
     final_plan = final_plan.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
+    valid, reason = _validate_final_output(final_plan)
+    if not valid:
+        repair_user = f"""
+Rewrite this itinerary to satisfy strict formatting:
+- No HTML tags
+- No tables
+- Must include Day 1, Day 2 style sections
+- Must include Total Estimated Cost
+
+Current text:
+{final_plan}
+"""
+        final_plan = _call_llm(client, humanizer_model, humanizer_system, repair_user, temperature=0.1)
+        final_plan = final_plan.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
+        valid, _ = _validate_final_output(final_plan)
+        if not valid:
+            # Soft fallback: do not block itinerary generation on style guardrail failure.
+            final_plan = (
+                "## Travel Itinerary\n\n"
+                + final_plan
+                + "\n\nNote: formatting was auto-recovered; content is still usable."
+            )
+
     return json.dumps(raw_plan, ensure_ascii=True), final_plan
